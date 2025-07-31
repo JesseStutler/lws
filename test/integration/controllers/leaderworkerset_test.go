@@ -32,6 +32,7 @@ import (
 	leaderworkerset "sigs.k8s.io/lws/api/leaderworkerset/v1"
 	"sigs.k8s.io/lws/pkg/controllers"
 	revisionutils "sigs.k8s.io/lws/pkg/utils/revision"
+	"sigs.k8s.io/lws/pkg/utils/schedulerprovider"
 	testing "sigs.k8s.io/lws/test/testutils"
 	"sigs.k8s.io/lws/test/wrappers"
 )
@@ -1972,6 +1973,163 @@ var _ = ginkgo.Describe("LeaderWorkerSet controller", func() {
 			},
 		}),
 	) // end of DescribeTable
+
+	ginkgo.Context("with gang scheduling enabled", ginkgo.Ordered, func() {
+		ginkgo.Context("with volcano scheduler provider", ginkgo.Ordered, func() {
+			ginkgo.BeforeAll(func() {
+				// Create Volcano provider for gang scheduling tests
+				sp, err := schedulerprovider.NewSchedulerProvider(schedulerprovider.Volcano, k8sClient)
+				gomega.Expect(err).NotTo(gomega.HaveOccurred())
+				podController.SchedulerProvider = sp
+			})
+
+			ginkgo.AfterAll(func() {
+				// Reset the SchedulerProvider to nil
+				podController.SchedulerProvider = nil
+			})
+
+			type gangTestCase struct {
+				makeLeaderWorkerSet func(nsName string) *wrappers.LeaderWorkerSetWrapper
+				updates             []*update
+				checkPodGroups      func(context.Context, client.Client, *leaderworkerset.LeaderWorkerSet) // New function to check PodGroups
+			}
+
+			ginkgo.DescribeTable("gang scheduling integration tests",
+				func(tc *gangTestCase) {
+					ctx := context.Background()
+					// Create test namespace for each entry.
+					ns := &corev1.Namespace{
+						ObjectMeta: metav1.ObjectMeta{
+							GenerateName: "lws-gang-ns-",
+						},
+					}
+					gomega.Expect(k8sClient.Create(ctx, ns)).To(gomega.Succeed())
+
+					// Create LeaderWorkerSet with volcano scheduler
+					lws := tc.makeLeaderWorkerSet(ns.Name).Obj()
+					lws.Spec.LeaderWorkerTemplate.LeaderTemplate.Spec.SchedulerName = "volcano"
+					lws.Spec.LeaderWorkerTemplate.WorkerTemplate.Spec.SchedulerName = "volcano"
+					// Verify LeaderWorkerSet created successfully.
+					ginkgo.By(fmt.Sprintf("creating LeaderWorkerSet %s", lws.Name))
+					gomega.Expect(k8sClient.Create(ctx, lws)).To(gomega.Succeed())
+					var leaderSts appsv1.StatefulSet
+					testing.GetLeaderStatefulset(ctx, lws, k8sClient, &leaderSts)
+					// create leader pods for lws controller
+					injectFn := func(pod *corev1.Pod) {
+						err := podController.SchedulerProvider.InjectPodGroupMetadata(pod)
+						gomega.Expect(err).NotTo(gomega.HaveOccurred())
+					}
+					gomega.Expect(testing.CreateLeaderPodsWithInjectedMeta(ctx, leaderSts, k8sClient, lws, 0, int(*lws.Spec.Replicas), injectFn)).To(gomega.Succeed())
+
+					// Check PodGroups are created correctly
+					if tc.checkPodGroups != nil {
+						tc.checkPodGroups(ctx, k8sClient, lws)
+					}
+
+					// Perform a series of updates to LeaderWorkerSet resources and check
+					// resulting LeaderWorkerSet state after each update.
+					for _, up := range tc.updates {
+						var leaderWorkerSet leaderworkerset.LeaderWorkerSet
+						gomega.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: lws.Name, Namespace: lws.Namespace}, &leaderWorkerSet)).To(gomega.Succeed())
+						if up.lwsUpdateFn != nil {
+							up.lwsUpdateFn(&leaderWorkerSet)
+						}
+
+						// after update, get the latest lws
+						gomega.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: lws.Name, Namespace: lws.Namespace}, &leaderWorkerSet)).To(gomega.Succeed())
+						if up.checkLWSState != nil {
+							up.checkLWSState(&leaderWorkerSet)
+						}
+						if up.checkLWSCondition != nil {
+							up.checkLWSCondition(ctx, k8sClient, &leaderWorkerSet, testing.Timeout)
+						}
+					}
+				},
+				ginkgo.Entry("PodGroup creation with correct owner references", &gangTestCase{
+					makeLeaderWorkerSet: func(nsName string) *wrappers.LeaderWorkerSetWrapper {
+						return wrappers.BuildLeaderWorkerSet(nsName).Name("test-gang-basic").Replica(2)
+					},
+					checkPodGroups: func(ctx context.Context, c client.Client, lws *leaderworkerset.LeaderWorkerSet) {
+						testing.ExpectValidPodGroups(ctx, c, podController.SchedulerProvider, lws, int(*lws.Spec.Replicas))
+					},
+				}),
+				ginkgo.Entry("Rolling update with PodGroup recreation", &gangTestCase{
+					makeLeaderWorkerSet: func(nsName string) *wrappers.LeaderWorkerSetWrapper {
+						return wrappers.BuildLeaderWorkerSet(nsName).Name("test-gang-rolling").Replica(3)
+					},
+					checkPodGroups: func(ctx context.Context, c client.Client, lws *leaderworkerset.LeaderWorkerSet) {
+						testing.ExpectValidPodGroups(ctx, c, podController.SchedulerProvider, lws, int(*lws.Spec.Replicas))
+					},
+					updates: []*update{
+						{
+							// Set LWS to available condition first
+							lwsUpdateFn: func(lws *leaderworkerset.LeaderWorkerSet) {
+								testing.SetPodGroupsToReady(ctx, k8sClient, lws, 3)
+							},
+							checkLWSState: func(lws *leaderworkerset.LeaderWorkerSet) {
+								testing.ExpectLeaderWorkerSetAvailable(ctx, k8sClient, lws, "All replicas are ready")
+								testing.ExpectStatefulsetPartitionEqualTo(ctx, k8sClient, lws, 0)
+								// Verify initial PodGroups are created correctly
+								testing.ExpectValidPodGroups(ctx, k8sClient, podController.SchedulerProvider, lws, int(*lws.Spec.Replicas))
+							},
+						},
+						{
+							// Trigger rolling update by updating worker template
+							lwsUpdateFn: func(lws *leaderworkerset.LeaderWorkerSet) {
+								testing.UpdateWorkerTemplate(ctx, k8sClient, lws)
+							},
+							checkLWSState: func(lws *leaderworkerset.LeaderWorkerSet) {
+								// Verify rolling update has started
+								testing.ExpectLeaderWorkerSetProgressing(ctx, k8sClient, lws, "Replicas are progressing")
+								testing.ExpectLeaderWorkerSetUpgradeInProgress(ctx, k8sClient, lws, "Rolling Upgrade is in progress")
+								// With 3 replicas and maxUnavailable=1, partition should start at 2 (updating replica 2 first)
+								testing.ExpectStatefulsetPartitionEqualTo(ctx, k8sClient, lws, 2)
+							},
+						},
+						{
+							// Simulate replica-2 update completion
+							lwsUpdateFn: func(lws *leaderworkerset.LeaderWorkerSet) {
+								testing.UpdatePodGroupAtIndex(ctx, k8sClient, podController.SchedulerProvider, lws, "2")
+								// Set new replica-2 to ready
+								testing.SetPodGroupToReady(ctx, k8sClient, lws.Name+"-2", lws)
+							},
+							checkLWSState: func(lws *leaderworkerset.LeaderWorkerSet) {
+								testing.ExpectValidPodGroupAtIndex(ctx, k8sClient, podController.SchedulerProvider, lws, "2")
+								// Partition should move to 1 (next replica to update)
+								testing.ExpectStatefulsetPartitionEqualTo(ctx, k8sClient, lws, 1)
+							},
+						},
+						{
+							// Simulate replica-1 update completion
+							lwsUpdateFn: func(lws *leaderworkerset.LeaderWorkerSet) {
+								testing.UpdatePodGroupAtIndex(ctx, k8sClient, podController.SchedulerProvider, lws, "1")
+								testing.SetPodGroupToReady(ctx, k8sClient, lws.Name+"-1", lws)
+							},
+							checkLWSState: func(lws *leaderworkerset.LeaderWorkerSet) {
+								testing.ExpectValidPodGroupAtIndex(ctx, k8sClient, podController.SchedulerProvider, lws, "1")
+								// Partition should move to 0 (last replica to update)
+								testing.ExpectStatefulsetPartitionEqualTo(ctx, k8sClient, lws, 0)
+							},
+						},
+						{
+							// Simulate replica-0 update completion
+							lwsUpdateFn: func(lws *leaderworkerset.LeaderWorkerSet) {
+								testing.UpdatePodGroupAtIndex(ctx, k8sClient, podController.SchedulerProvider, lws, "0")
+								testing.SetPodGroupToReady(ctx, k8sClient, lws.Name+"-0", lws)
+							},
+							checkLWSState: func(lws *leaderworkerset.LeaderWorkerSet) {
+								testing.ExpectValidPodGroupAtIndex(ctx, k8sClient, podController.SchedulerProvider, lws, "0")
+								// Verify rolling update completion
+								testing.ExpectLeaderWorkerSetAvailable(ctx, k8sClient, lws, "All replicas are ready")
+								testing.ExpectLeaderWorkerSetNotProgressing(ctx, k8sClient, lws, "Replicas are progressing")
+								testing.ExpectLeaderWorkerSetNoUpgradeInProgress(ctx, k8sClient, lws, "Rolling Upgrade is in progress")
+							},
+						},
+					},
+				}),
+			)
+		})
+	}) // end of gang scheduling Context
 }) // end of Describe
 
 func ToUnstructured(o client.Object) (*unstructured.Unstructured, error) {
