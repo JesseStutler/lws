@@ -31,16 +31,23 @@ import (
 	"sigs.k8s.io/lws/pkg/utils"
 	acceleratorutils "sigs.k8s.io/lws/pkg/utils/accelerators"
 	podutils "sigs.k8s.io/lws/pkg/utils/pod"
+	"sigs.k8s.io/lws/pkg/utils/schedulerprovider"
 	statefulsetutils "sigs.k8s.io/lws/pkg/utils/statefulset"
 )
 
-type PodWebhook struct{}
+type PodWebhook struct {
+	SchedulerProvider schedulerprovider.SchedulerProvider
+}
 
-func SetupPodWebhook(mgr ctrl.Manager) error {
+func NewPodWebhook() *PodWebhook {
+	return &PodWebhook{}
+}
+
+func (p *PodWebhook) SetupPodWebhook(mgr ctrl.Manager) error {
 	return ctrl.NewWebhookManagedBy(mgr).
 		For(&corev1.Pod{}).
-		WithDefaulter(&PodWebhook{}).
-		WithValidator(&PodWebhook{}).
+		WithDefaulter(p).
+		WithValidator(p).
 		Complete()
 }
 
@@ -156,6 +163,13 @@ func (p *PodWebhook) Default(ctx context.Context, obj runtime.Object) error {
 			if subEpKey, foundSubEpKey := pod.Annotations[leaderworkerset.SubGroupExclusiveKeyAnnotationKey]; foundSubEpKey {
 				SetExclusiveAffinities(pod, subGroupUniqueKey, subEpKey, leaderworkerset.SubGroupUniqueHashLabelKey)
 			}
+		}
+	}
+
+	if p.SchedulerProvider != nil {
+		err = p.SchedulerProvider.InjectPodGroupMetadata(pod)
+		if err != nil {
+			return err
 		}
 	}
 

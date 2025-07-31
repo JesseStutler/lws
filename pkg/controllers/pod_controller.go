@@ -44,14 +44,16 @@ import (
 	controllerutils "sigs.k8s.io/lws/pkg/utils/controller"
 	podutils "sigs.k8s.io/lws/pkg/utils/pod"
 	revisionutils "sigs.k8s.io/lws/pkg/utils/revision"
+	"sigs.k8s.io/lws/pkg/utils/schedulerprovider"
 	statefulsetutils "sigs.k8s.io/lws/pkg/utils/statefulset"
 )
 
 // PodReconciler reconciles a LeaderWorkerSet object
 type PodReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
-	Record record.EventRecorder
+	Scheme            *runtime.Scheme
+	Record            record.EventRecorder
+	SchedulerProvider schedulerprovider.SchedulerProvider
 }
 
 func NewPodReconciler(client client.Client, schema *runtime.Scheme, record record.EventRecorder) *PodReconciler {
@@ -112,6 +114,13 @@ func (r *PodReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 
 	if leaderWorkerSet.Spec.NetworkConfig != nil && *leaderWorkerSet.Spec.NetworkConfig.SubdomainPolicy == leaderworkerset.SubdomainUniquePerReplica {
 		if err := controllerutils.CreateHeadlessServiceIfNotExists(ctx, r.Client, r.Scheme, &leaderWorkerSet, pod.Name, map[string]string{leaderworkerset.SetNameLabelKey: leaderWorkerSet.Name, leaderworkerset.GroupIndexLabelKey: pod.Labels[leaderworkerset.GroupIndexLabelKey]}, &pod); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	if r.SchedulerProvider != nil {
+		err = r.SchedulerProvider.CreatePodGroupIfNotExists(ctx, &leaderWorkerSet, &pod)
+		if err != nil {
 			return ctrl.Result{}, err
 		}
 	}
