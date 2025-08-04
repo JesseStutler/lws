@@ -19,7 +19,11 @@ package utils
 import (
 	"crypto/sha1"
 	"encoding/hex"
+	quotav1 "k8s.io/apiserver/pkg/quota/v1"
+	resourcehelper "k8s.io/component-helpers/resource"
+	"k8s.io/utils/ptr"
 	"os"
+	leaderworkerset "sigs.k8s.io/lws/api/leaderworkerset/v1"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -73,4 +77,26 @@ func GetOperatorNamespace() string {
 		}
 	}
 	return defaultNamespace
+}
+
+// CalculatePGMinResources calculates the minimum resources needed for an entire PodGroup [1 Leader + (size-1) Worker pods]
+func CalculatePGMinResources(lws *leaderworkerset.LeaderWorkerSet) corev1.ResourceList {
+	// Calculate leader resources.
+	leaderTemplate := lws.Spec.LeaderWorkerTemplate.LeaderTemplate
+	if leaderTemplate == nil {
+		// If no leader template is specified, use worker template.
+		leaderTemplate = &lws.Spec.LeaderWorkerTemplate.WorkerTemplate
+	}
+	totalResources := resourcehelper.PodRequests(&corev1.Pod{Spec: leaderTemplate.Spec}, resourcehelper.PodResourcesOptions{})
+
+	// Calculate and add worker resources for (size-1) workers.
+	workerCount := ptr.Deref(lws.Spec.LeaderWorkerTemplate.Size, 1) - 1
+	if workerCount > 0 {
+		workerResources := resourcehelper.PodRequests(&corev1.Pod{Spec: lws.Spec.LeaderWorkerTemplate.WorkerTemplate.Spec}, resourcehelper.PodResourcesOptions{})
+		for i := int32(0); i < workerCount; i++ {
+			totalResources = quotav1.Add(totalResources, workerResources)
+		}
+	}
+
+	return totalResources
 }
